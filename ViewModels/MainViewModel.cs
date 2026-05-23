@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
 using System.IO;
 using System.Windows;
 using System.Windows.Threading;
@@ -14,6 +15,7 @@ public partial class MainViewModel : ObservableObject
 {
     private readonly FileProcessorService _processor;
     private readonly SettingsService _settings;
+    private readonly PresetService _presets;
     private CancellationTokenSource? _saveCts;
     private DispatcherTimer? _countdownTimer;
 
@@ -39,16 +41,38 @@ public partial class MainViewModel : ObservableObject
     [ObservableProperty]
     private int _countdownSeconds;
 
+    [ObservableProperty]
+    [NotifyCanExecuteChangedFor(nameof(SavePresetCommand))]
+    [NotifyCanExecuteChangedFor(nameof(LoadPresetCommand))]
+    [NotifyCanExecuteChangedFor(nameof(DeletePresetCommand))]
+    private string _presetName = string.Empty;
+
+    [ObservableProperty]
+    private ObservableCollection<Preset> _presetList = [];
+
+    public ObservableCollection<SearchReplaceRule> Rules { get; } = [];
+
     public bool IsNotRunning => !IsRunning;
 
-    public MainViewModel(FileProcessorService processor, SettingsService settings)
+    public MainViewModel(FileProcessorService processor, SettingsService settings, PresetService presets)
     {
         _processor = processor;
         _settings = settings;
+        _presets = presets;
         _processor.OnError += msg =>
             Application.Current.Dispatcher.BeginInvoke(() => StatusMessage = msg);
 
+        Rules.CollectionChanged += OnRulesCollectionChanged;
+        PresetList = new ObservableCollection<Preset>(_presets.Load());
         RestoreSettings();
+    }
+
+    private void OnRulesCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        if (e.NewItems != null)
+            foreach (SearchReplaceRule rule in e.NewItems)
+                rule.PropertyChanged += (_, _) => ScheduleSave();
+        ScheduleSave();
     }
 
     private void RestoreSettings()
@@ -56,13 +80,16 @@ public partial class MainViewModel : ObservableObject
         var s = _settings.Load();
         IntervalSeconds = s.IntervalSeconds;
 
+        foreach (var r in s.Rules)
+            Rules.Add(new SearchReplaceRule { SearchPattern = r.SearchPattern, Replacement = r.Replacement });
+
         if (string.IsNullOrEmpty(s.FolderPath))
             return;
 
         if (Directory.Exists(s.FolderPath))
         {
             FolderPath = s.FolderPath;
-            LoadFiles(s.FolderPath, s.SelectedFileNames);
+            LoadFiles(s.FolderPath, s.Files);
         }
         else
         {
@@ -70,16 +97,21 @@ public partial class MainViewModel : ObservableObject
         }
     }
 
-    private void LoadFiles(string folder, ICollection<string>? selectedNames = null)
+    private void LoadFiles(string folder, ICollection<FileSettings>? savedFiles = null)
     {
         Files = new ObservableCollection<FileItem>(
             Directory.GetFiles(folder, "*.txt")
                 .OrderBy(f => f)
-                .Select(f => new FileItem
+                .Select(f =>
                 {
-                    FilePath = f,
-                    FileName = Path.GetFileName(f),
-                    IsSelected = selectedNames is null || selectedNames.Contains(Path.GetFileName(f))
+                    var name = Path.GetFileName(f);
+                    var saved = savedFiles?.FirstOrDefault(s => s.FileName == name);
+                    return new FileItem
+                    {
+                        FilePath = f,
+                        FileName = name,
+                        LineCount = saved?.LineCount ?? 0,
+                    };
                 }));
 
         foreach (var file in Files)
@@ -98,12 +130,12 @@ public partial class MainViewModel : ObservableObject
     }
 
     private bool CanStart() =>
-        !IsRunning && Files.Count > 0 && Files.Any(f => f.IsSelected) && IntervalSeconds >= 1;
+        !IsRunning && Files.Count > 0 && Files.Any(f => f.LineCount > 0) && IntervalSeconds >= 1;
 
     [RelayCommand(CanExecute = nameof(CanStart))]
     private void Start()
     {
-        _processor.Start(Files, IntervalSeconds);
+        _processor.Start(Files, Rules, IntervalSeconds);
         IsRunning = true;
         StatusMessage = "Running…";
         StartCountdown();
@@ -143,15 +175,70 @@ public partial class MainViewModel : ObservableObject
     [RelayCommand]
     private void SelectAll()
     {
-        foreach (var f in Files) f.IsSelected = true;
-        StartCommand.NotifyCanExecuteChanged();
+        foreach (var f in Files) f.LineCount = 1;
     }
 
     [RelayCommand]
     private void DeselectAll()
     {
-        foreach (var f in Files) f.IsSelected = false;
-        StartCommand.NotifyCanExecuteChanged();
+        foreach (var f in Files) f.LineCount = 0;
+    }
+
+    [RelayCommand]
+    private void AddRule() => Rules.Add(new SearchReplaceRule());
+
+    [RelayCommand]
+    private void RemoveRule(SearchReplaceRule rule) => Rules.Remove(rule);
+
+    private bool CanSavePreset() => !string.IsNullOrWhiteSpace(PresetName);
+
+    [RelayCommand(CanExecute = nameof(CanSavePreset))]
+    private void SavePreset()
+    {
+        var preset = new Preset
+        {
+            Name = PresetName,
+            Rules = Rules.Select(r => new PersistedRule
+            {
+                SearchPattern = r.SearchPattern,
+                Replacement = r.Replacement,
+            }).ToList()
+        };
+
+        var existing = PresetList.FirstOrDefault(p => p.Name == PresetName);
+        if (existing is not null)
+            PresetList[PresetList.IndexOf(existing)] = preset;
+        else
+            PresetList.Add(preset);
+
+        _presets.Save([.. PresetList]);
+        LoadPresetCommand.NotifyCanExecuteChanged();
+        DeletePresetCommand.NotifyCanExecuteChanged();
+    }
+
+    private bool CanLoadPreset() => PresetList.Any(p => p.Name == PresetName);
+
+    [RelayCommand(CanExecute = nameof(CanLoadPreset))]
+    private void LoadPreset()
+    {
+        var preset = PresetList.First(p => p.Name == PresetName);
+        Rules.Clear();
+        foreach (var rule in preset.Rules)
+            Rules.Add(new SearchReplaceRule { SearchPattern = rule.SearchPattern, Replacement = rule.Replacement });
+    }
+
+    private bool CanDeletePreset() => PresetList.Any(p => p.Name == PresetName);
+
+    [RelayCommand(CanExecute = nameof(CanDeletePreset))]
+    private void DeletePreset()
+    {
+        var existing = PresetList.FirstOrDefault(p => p.Name == PresetName);
+        if (existing is null) return;
+        PresetList.Remove(existing);
+        _presets.Save([.. PresetList]);
+        PresetName = string.Empty;
+        LoadPresetCommand.NotifyCanExecuteChanged();
+        DeletePresetCommand.NotifyCanExecuteChanged();
     }
 
     partial void OnIntervalSecondsChanged(int value) => ScheduleSave();
@@ -175,7 +262,16 @@ public partial class MainViewModel : ObservableObject
         {
             FolderPath = FolderPath,
             IntervalSeconds = IntervalSeconds,
-            SelectedFileNames = Files.Where(f => f.IsSelected).Select(f => f.FileName).ToList()
+            Files = Files.Select(f => new FileSettings
+            {
+                FileName = f.FileName,
+                LineCount = f.LineCount,
+            }).ToList(),
+            Rules = Rules.Select(r => new PersistedRule
+            {
+                SearchPattern = r.SearchPattern,
+                Replacement = r.Replacement,
+            }).ToList()
         });
     }
 }

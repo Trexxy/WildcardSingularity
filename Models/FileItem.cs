@@ -8,5 +8,9 @@ public partial class FileItem : ObservableObject
     public string FileName { get; init; } = string.Empty;
 
     [ObservableProperty]
-    private bool _isSelected = true;
+    private int _lineCount = 0;
+
+    public bool IsActive => LineCount > 0;
+
+    partial void OnLineCountChanged(int value) => OnPropertyChanged(nameof(IsActive));
 }
