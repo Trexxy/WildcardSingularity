@@ -1,0 +1,26 @@
+# Build output
+bin/
+obj/
+
+# User-specific files
+*.user
+*.suo
+.vs/
+
+# Rider
+.idea/
+
+# NuGet
+*.nupkg
+packages/
+project.lock.json
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# App settings generated at runtime (stored in %AppData%, not the repo)
+settings.json
+
+# Claude
+.claude/
